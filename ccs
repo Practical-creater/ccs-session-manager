@@ -2,11 +2,11 @@
 """
 ccs — Claude Code session manager
 
-List, inspect, and clean up Claude Code sessions from the command line.
+List, inspect, move, and clean up Claude Code sessions from the command line.
 Claude Code stores each conversation as a .jsonl file under
 ~/.claude/projects/<encoded-cwd>/, keyed by the directory it was launched from.
-This tool gives you a single place to see them all and remove the ones you
-don't want — including duplicate copies of the same session across folders.
+This tool gives you a single place to see them all, relocate them, and remove
+the ones you don't want — including duplicate copies of a session across folders.
 
 COMMANDS
   ccs list
@@ -14,11 +14,16 @@ COMMANDS
       session copied into multiple folders shows up once per location.
       STATUS:  ● active = running   |   idle = closed   |   orphaned = file only
 
+  ccs move <id|name> <dest-dir>
+      Move a session so it becomes resumable from <dest-dir>: copies its file
+      into that directory's Claude project folder and removes the original.
+      REFUSES if the session is currently running — a live process keeps
+      rewriting its file, so exit it first (then `claude --resume` in <dest-dir>).
+
   ccs delete <id|name>
       Delete a session by 4+ char ID prefix or by name. If the session exists
       in several folders, each copy is listed so you can pick which to remove
-      (or [a]ll). Running sessions are flagged — exit them first, otherwise the
-      live process rewrites the file. Removes both the .jsonl and its metadata.
+      (or [a]ll). Running sessions are flagged. Removes the .jsonl + metadata.
 
   ccs clean
       Delete all orphaned sessions (a .jsonl with no metadata — usually left
@@ -34,17 +39,17 @@ COMMANDS
 DATA LOCATIONS
   metadata      ~/.claude/sessions/<pid>.json
   conversation  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
-
-  To move a session to another directory, copy its .jsonl into the target
-  directory's projects folder, then run `claude --continue` (or --resume) there.
 """
 
 import json
+import os
+import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CLAUDE_DIR   = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -60,15 +65,20 @@ else:
 _decode_cache = {}
 
 
+def encode_dir(path):
+    """Encode an absolute directory path into its Claude project-folder name.
+    Claude replaces every non-alphanumeric character with '-'."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
 def decode_folder(folder):
     """Reconstruct the real directory path from an encoded project-folder name.
 
-    Claude encodes a cwd into the folder name by replacing '/' with '-', which
-    is lossy: a literal '-' in a directory name is indistinguishable from a
-    separator (e.g. 'cc-project' vs 'cc/project'). We resolve the ambiguity by
-    walking the real filesystem token-by-token, preferring whichever variant
-    actually exists. Falls back to naive '/'-substitution for paths that no
-    longer exist on disk (e.g. deleted directories of orphaned sessions).
+    The encoding (every non-alphanumeric char -> '-') is lossy: a literal '-'
+    in a directory name is indistinguishable from a separator (e.g.
+    'cc-project' vs 'cc/project'). We resolve the ambiguity by walking the real
+    filesystem token-by-token, preferring whichever variant actually exists.
+    Falls back to naive '/'-substitution for paths that no longer exist on disk.
     """
     if not folder.startswith("-"):
         return folder
@@ -84,6 +94,17 @@ def decode_folder(folder):
             path = slash
     _decode_cache[folder] = path
     return path
+
+
+def pid_alive(pid):
+    """True if a process with this PID currently exists."""
+    try:
+        os.kill(int(pid), 0)
+    except (ValueError, TypeError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def fmt_size(b):
@@ -139,6 +160,7 @@ def load_records():
                     "cwd": d.get("cwd", ""),
                     "status": d.get("status", "idle"),
                     "updated": d.get("updatedAt", d.get("startedAt", 0)),
+                    "pid": d.get("pid"),
                     "meta_file": f,
                 })
 
@@ -158,19 +180,20 @@ def load_records():
                     "meta_file": None,
                     "name": "",
                     "status": "orphaned",
+                    "pid": None,
                     "size": jsonl.stat().st_size,
                     "updated": jsonl.stat().st_mtime * 1000,
                     "messages": count_messages(jsonl),
                 }
                 # Attach metadata whose recorded cwd matches this file's real
-                # location — comparing real paths, so it's immune to the
-                # encoding ambiguity above.
+                # location — comparing real paths, immune to encoding ambiguity.
                 for i, m in enumerate(meta_by_sid.get(sid, [])):
                     if (sid, i) in used:
                         continue
                     if m["cwd"] == cwd:
                         rec["name"] = m["name"]
                         rec["status"] = m["status"]
+                        rec["pid"] = m["pid"]
                         rec["meta_file"] = m["meta_file"]
                         if m["updated"]:
                             rec["updated"] = m["updated"]
@@ -186,10 +209,15 @@ def load_records():
             records.append({
                 "id": sid, "folder": "", "cwd": m["cwd"],
                 "jsonl_file": None, "meta_file": m["meta_file"],
-                "name": m["name"], "status": m["status"],
+                "name": m["name"], "status": m["status"], "pid": m["pid"],
                 "size": 0, "updated": m["updated"], "messages": 0,
             })
     return records
+
+
+def is_running(rec):
+    """A session is 'running' if a live process is holding it open."""
+    return pid_alive(rec.get("pid")) if rec.get("pid") else rec.get("status") == "busy"
 
 
 def status_str(s):
@@ -197,6 +225,10 @@ def status_str(s):
         "busy": f"{GREEN}● active{RESET}",
         "orphaned": f"{YELLOW}orphaned{RESET}",
     }.get(s, DIM + "idle" + RESET)
+
+
+def short(path):
+    return str(path).replace(str(Path.home()), "~")
 
 
 def confirm(prompt):
@@ -215,17 +247,90 @@ def cmd_list():
     if not recs:
         print("No sessions found.")
         return
-    home = str(Path.home())
     print(f"\n{BOLD}  ID   {'NAME':<22} {'DIR':<36} {'UPDATED':<12} {'MSG':>4} {'SIZE':>6}  STATUS{RESET}")
     print("─" * 102)
     for r in recs:
         name = r["name"] or DIM + "(unnamed)" + RESET
-        cwd = r["cwd"].replace(home, "~")[-36:]
+        cwd = short(r["cwd"])[-36:]
         msgs = str(r["messages"]) if r["messages"] else DIM + "0" + RESET
         size = fmt_size(r["size"]) if r["size"] else DIM + "—" + RESET
         print(f"{CYAN}{r['id'][:4]}{RESET}  {name:<22} {DIM}{cwd:<36}{RESET} "
               f"{fmt_time(r['updated']):<12} {msgs:>4} {size:>6}  {status_str(r['status'])}")
     print(f"\n{DIM}Total: {len(recs)} session files{RESET}\n")
+
+
+def _pick(matches, verb):
+    """Resolve an ambiguous id/name to a single record via a numbered prompt."""
+    if len(matches) == 1:
+        return matches[0]
+    print(f"{YELLOW}Found {len(matches)} copies — pick which to {verb}:{RESET}")
+    for i, r in enumerate(matches, 1):
+        live = f" {GREEN}(running!){RESET}" if is_running(r) else ""
+        print(f"  [{i}] {CYAN}{r['id'][:4]}{RESET}  {(r['name'] or '(unnamed)'):<18} {DIM}{short(r['cwd'])}{RESET}{live}")
+    print("  [q] cancel")
+    try:
+        c = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if c.isdigit() and 1 <= int(c) <= len(matches):
+        return matches[int(c) - 1]
+    print("Cancelled.")
+    return None
+
+
+def cmd_move(query, dest):
+    dest_abs = os.path.abspath(os.path.expanduser(dest))
+    dest_folder = encode_dir(dest_abs)
+    dest_dir = PROJECTS_DIR / dest_folder
+
+    recs = load_records()
+    matches = [r for r in recs if r["jsonl_file"] and (r["id"].startswith(query) or r["name"] == query)]
+    if not matches:
+        print(f"{RED}No session matching '{query}'{RESET}")
+        sys.exit(1)
+
+    candidates = [r for r in matches if r["folder"] != dest_folder]
+    if not candidates:
+        print(f"{YELLOW}That session is already in {short(dest_abs)}.{RESET}")
+        return
+
+    src = _pick(candidates, "move")
+    if src is None:
+        return
+
+    if is_running(src):
+        pid = src.get("pid")
+        print(f"{RED}✗ This session is currently running{f' (PID {pid})' if pid else ''}.{RESET}")
+        print("  A live session keeps rewriting its file, so it can't be moved cleanly.")
+        print(f"  Exit it first {DIM}(/exit){RESET}, then run this command again.")
+        sys.exit(1)
+
+    src_path = src["jsonl_file"]
+    dest_path = dest_dir / src_path.name
+    print(f"Move {CYAN}{src['id'][:4]}{RESET} ({src['name'] or 'unnamed'})")
+    print(f"  from  {short(src['cwd'])}")
+    print(f"  to    {short(dest_abs)}")
+    if dest_path.exists():
+        print(f"  {YELLOW}(overwrites an existing copy there){RESET}")
+    if not confirm(f"Proceed? [{BOLD}y/N{RESET}] "):
+        print("Cancelled.")
+        return
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dest_path)
+    if not dest_path.exists() or dest_path.stat().st_size != src_path.stat().st_size:
+        print(f"{RED}✗ Copy failed — source left untouched.{RESET}")
+        sys.exit(1)
+    src_path.unlink()
+    if src["meta_file"] and Path(src["meta_file"]).exists():
+        Path(src["meta_file"]).unlink()
+
+    print(f"{GREEN}✓ Moved.{RESET}")
+    if not Path(dest_abs).is_dir():
+        print(f"{YELLOW}note: {short(dest_abs)} doesn't exist as a directory yet — "
+              f"create it before resuming there.{RESET}")
+    print(f"Resume it with:  {BOLD}cd {short(dest_abs)} && claude --resume{RESET}")
 
 
 def cmd_delete(query):
@@ -240,9 +345,8 @@ def cmd_delete(query):
     else:
         print(f"{YELLOW}Found {len(matches)} copies of this session — pick which to delete:{RESET}")
         for i, r in enumerate(matches, 1):
-            live = f" {GREEN}(running!){RESET}" if r["status"] == "busy" else ""
-            cwd = r["cwd"].replace(str(Path.home()), "~")
-            print(f"  [{i}] {CYAN}{r['id'][:4]}{RESET}  {(r['name'] or '(unnamed)'):<18} {DIM}{cwd}{RESET}{live}")
+            live = f" {GREEN}(running!){RESET}" if is_running(r) else ""
+            print(f"  [{i}] {CYAN}{r['id'][:4]}{RESET}  {(r['name'] or '(unnamed)'):<18} {DIM}{short(r['cwd'])}{RESET}{live}")
         print("  [a] all    [q] cancel")
         try:
             c = input("> ").strip().lower()
@@ -258,7 +362,7 @@ def cmd_delete(query):
             return
 
     for r in targets:
-        if r["status"] == "busy":
+        if is_running(r):
             print(f"{YELLOW}⚠ {r['id'][:4]} is currently running — exit that session first, "
                   f"or the file will be recreated.{RESET}")
 
@@ -281,8 +385,7 @@ def cmd_clean():
     total = sum(r["size"] for r in orphans)
     print(f"Found {len(orphans)} orphaned file(s)  ({fmt_size(total)} total):\n")
     for r in sorted(orphans, key=lambda r: r["updated"], reverse=True):
-        cwd = r["cwd"].replace(str(Path.home()), "~")[-50:]
-        print(f"  {r['id'][:4]}  {cwd:<50}  {fmt_size(r['size']):>6}  {fmt_time(r['updated'])}")
+        print(f"  {r['id'][:4]}  {short(r['cwd'])[-50:]:<50}  {fmt_size(r['size']):>6}  {fmt_time(r['updated'])}")
     if not confirm(f"\nDelete all {len(orphans)}? [{BOLD}y/N{RESET}] "):
         print("Cancelled.")
         return
@@ -295,7 +398,7 @@ def cmd_clean():
 def cmd_prune(days):
     import time
     cutoff = time.time() * 1000 - days * 86400 * 1000
-    old = [r for r in load_records() if r["updated"] < cutoff and r["status"] != "busy"]
+    old = [r for r in load_records() if r["updated"] < cutoff and not is_running(r)]
     if not old:
         print(f"No sessions older than {days} days.")
         return
@@ -321,6 +424,8 @@ def main():
         print(f"ccs {VERSION}")
     elif a[0] == "list":
         cmd_list()
+    elif a[0] == "move" and len(a) > 2:
+        cmd_move(a[1], a[2])
     elif a[0] == "delete" and len(a) > 1:
         cmd_delete(a[1])
     elif a[0] == "clean":
