@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+ccs — Claude Code session manager
+
+List, inspect, and clean up Claude Code sessions from the command line.
+Claude Code stores each conversation as a .jsonl file under
+~/.claude/projects/<encoded-cwd>/, keyed by the directory it was launched from.
+This tool gives you a single place to see them all and remove the ones you
+don't want — including duplicate copies of the same session across folders.
+
+COMMANDS
+  ccs list
+      List every session, newest first. One row per conversation file, so a
+      session copied into multiple folders shows up once per location.
+      STATUS:  ● active = running   |   idle = closed   |   orphaned = file only
+
+  ccs delete <id|name>
+      Delete a session by 4+ char ID prefix or by name. If the session exists
+      in several folders, each copy is listed so you can pick which to remove
+      (or [a]ll). Running sessions are flagged — exit them first, otherwise the
+      live process rewrites the file. Removes both the .jsonl and its metadata.
+
+  ccs clean
+      Delete all orphaned sessions (a .jsonl with no metadata — usually left
+      behind after switching working directories). Asks before deleting.
+
+  ccs prune <days>
+      Delete sessions whose last activity is older than <days> days.
+      Running sessions are never touched.  e.g.  ccs prune 30
+
+  ccs version | -v | --version
+  ccs help    | -h | --help
+
+DATA LOCATIONS
+  metadata      ~/.claude/sessions/<pid>.json
+  conversation  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+
+  To move a session to another directory, copy its .jsonl into the target
+  directory's projects folder, then run `claude --continue` (or --resume) there.
+"""
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+CLAUDE_DIR   = Path.home() / ".claude"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Colors only when writing to a real terminal (so piped output stays clean).
+if sys.stdout.isatty():
+    RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+    RED, GREEN, YELLOW, CYAN = "\033[31m", "\033[32m", "\033[33m", "\033[36m"
+else:
+    RESET = BOLD = DIM = RED = GREEN = YELLOW = CYAN = ""
+
+_decode_cache = {}
+
+
+def decode_folder(folder):
+    """Reconstruct the real directory path from an encoded project-folder name.
+
+    Claude encodes a cwd into the folder name by replacing '/' with '-', which
+    is lossy: a literal '-' in a directory name is indistinguishable from a
+    separator (e.g. 'cc-project' vs 'cc/project'). We resolve the ambiguity by
+    walking the real filesystem token-by-token, preferring whichever variant
+    actually exists. Falls back to naive '/'-substitution for paths that no
+    longer exist on disk (e.g. deleted directories of orphaned sessions).
+    """
+    if not folder.startswith("-"):
+        return folder
+    if folder in _decode_cache:
+        return _decode_cache[folder]
+    path = ""
+    for tok in folder[1:].split("-"):
+        slash = path + "/" + tok
+        dash = path + "-" + tok if path else None
+        if dash and Path(dash).exists() and not Path(slash).exists():
+            path = dash
+        else:
+            path = slash
+    _decode_cache[folder] = path
+    return path
+
+
+def fmt_size(b):
+    for unit in ["B", "KB", "MB"]:
+        if b < 1024:
+            return f"{b:.0f}{unit}"
+        b /= 1024
+    return f"{b:.1f}GB"
+
+
+def fmt_time(ts_ms):
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%m-%d %H:%M")
+
+
+def count_messages(path):
+    """Number of user/assistant turns in a conversation file."""
+    try:
+        n = 0
+        with open(path) as f:
+            for line in f:
+                try:
+                    if json.loads(line).get("type") in ("user", "assistant"):
+                        n += 1
+                except Exception:
+                    continue
+        return n
+    except Exception:
+        return 0
+
+
+def load_records():
+    """One record per physical .jsonl file (so duplicate copies of a session in
+    different folders are distinct rows), plus any metadata that has no file.
+
+    The displayed directory is the file's *physical* location (where
+    `claude --resume` will find it), not the cwd baked into the conversation —
+    those differ once a session has been copied elsewhere.
+    """
+    meta_by_sid = {}
+    if SESSIONS_DIR.exists():
+        for f in SESSIONS_DIR.iterdir():
+            if f.suffix != ".json":
+                continue
+            try:
+                d = json.loads(f.read_text())
+            except Exception:
+                continue
+            sid = d.get("sessionId")
+            if sid:
+                meta_by_sid.setdefault(sid, []).append({
+                    "name": d.get("name", ""),
+                    "cwd": d.get("cwd", ""),
+                    "status": d.get("status", "idle"),
+                    "updated": d.get("updatedAt", d.get("startedAt", 0)),
+                    "meta_file": f,
+                })
+
+    records, used = [], set()
+    if PROJECTS_DIR.exists():
+        for proj in PROJECTS_DIR.iterdir():
+            if not proj.is_dir():
+                continue
+            cwd = decode_folder(proj.name)
+            for jsonl in proj.glob("*.jsonl"):
+                sid = jsonl.stem
+                rec = {
+                    "id": sid,
+                    "folder": proj.name,
+                    "cwd": cwd,
+                    "jsonl_file": jsonl,
+                    "meta_file": None,
+                    "name": "",
+                    "status": "orphaned",
+                    "size": jsonl.stat().st_size,
+                    "updated": jsonl.stat().st_mtime * 1000,
+                    "messages": count_messages(jsonl),
+                }
+                # Attach metadata whose recorded cwd matches this file's real
+                # location — comparing real paths, so it's immune to the
+                # encoding ambiguity above.
+                for i, m in enumerate(meta_by_sid.get(sid, [])):
+                    if (sid, i) in used:
+                        continue
+                    if m["cwd"] == cwd:
+                        rec["name"] = m["name"]
+                        rec["status"] = m["status"]
+                        rec["meta_file"] = m["meta_file"]
+                        if m["updated"]:
+                            rec["updated"] = m["updated"]
+                        used.add((sid, i))
+                        break
+                records.append(rec)
+
+    # Metadata with no conversation file → standalone rows.
+    for sid, metas in meta_by_sid.items():
+        for i, m in enumerate(metas):
+            if (sid, i) in used:
+                continue
+            records.append({
+                "id": sid, "folder": "", "cwd": m["cwd"],
+                "jsonl_file": None, "meta_file": m["meta_file"],
+                "name": m["name"], "status": m["status"],
+                "size": 0, "updated": m["updated"], "messages": 0,
+            })
+    return records
+
+
+def status_str(s):
+    return {
+        "busy": f"{GREEN}● active{RESET}",
+        "orphaned": f"{YELLOW}orphaned{RESET}",
+    }.get(s, DIM + "idle" + RESET)
+
+
+def confirm(prompt):
+    print(prompt, end="", flush=True)
+    try:
+        return input().strip().lower() == "y"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_list():
+    recs = sorted(load_records(), key=lambda r: r["updated"], reverse=True)
+    if not recs:
+        print("No sessions found.")
+        return
+    home = str(Path.home())
+    print(f"\n{BOLD}  ID   {'NAME':<22} {'DIR':<36} {'UPDATED':<12} {'MSG':>4} {'SIZE':>6}  STATUS{RESET}")
+    print("─" * 102)
+    for r in recs:
+        name = r["name"] or DIM + "(unnamed)" + RESET
+        cwd = r["cwd"].replace(home, "~")[-36:]
+        msgs = str(r["messages"]) if r["messages"] else DIM + "0" + RESET
+        size = fmt_size(r["size"]) if r["size"] else DIM + "—" + RESET
+        print(f"{CYAN}{r['id'][:4]}{RESET}  {name:<22} {DIM}{cwd:<36}{RESET} "
+              f"{fmt_time(r['updated']):<12} {msgs:>4} {size:>6}  {status_str(r['status'])}")
+    print(f"\n{DIM}Total: {len(recs)} session files{RESET}\n")
+
+
+def cmd_delete(query):
+    recs = load_records()
+    matches = [r for r in recs if r["id"].startswith(query) or r["name"] == query]
+    if not matches:
+        print(f"{RED}No session matching '{query}'{RESET}")
+        sys.exit(1)
+
+    if len(matches) == 1:
+        targets = matches
+    else:
+        print(f"{YELLOW}Found {len(matches)} copies of this session — pick which to delete:{RESET}")
+        for i, r in enumerate(matches, 1):
+            live = f" {GREEN}(running!){RESET}" if r["status"] == "busy" else ""
+            cwd = r["cwd"].replace(str(Path.home()), "~")
+            print(f"  [{i}] {CYAN}{r['id'][:4]}{RESET}  {(r['name'] or '(unnamed)'):<18} {DIM}{cwd}{RESET}{live}")
+        print("  [a] all    [q] cancel")
+        try:
+            c = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if c == "a":
+            targets = matches
+        elif c.isdigit() and 1 <= int(c) <= len(matches):
+            targets = [matches[int(c) - 1]]
+        else:
+            print("Cancelled.")
+            return
+
+    for r in targets:
+        if r["status"] == "busy":
+            print(f"{YELLOW}⚠ {r['id'][:4]} is currently running — exit that session first, "
+                  f"or the file will be recreated.{RESET}")
+
+    if not confirm(f"Delete {len(targets)} item(s)? [{BOLD}y/N{RESET}] "):
+        print("Cancelled.")
+        return
+    for r in targets:
+        for f in (r["meta_file"], r["jsonl_file"]):
+            if f and Path(f).exists():
+                Path(f).unlink()
+                print(f"{DIM}removed {f}{RESET}")
+    print(f"{GREEN}✓ Deleted{RESET}")
+
+
+def cmd_clean():
+    orphans = [r for r in load_records() if r["status"] == "orphaned"]
+    if not orphans:
+        print("No orphaned sessions found.")
+        return
+    total = sum(r["size"] for r in orphans)
+    print(f"Found {len(orphans)} orphaned file(s)  ({fmt_size(total)} total):\n")
+    for r in sorted(orphans, key=lambda r: r["updated"], reverse=True):
+        cwd = r["cwd"].replace(str(Path.home()), "~")[-50:]
+        print(f"  {r['id'][:4]}  {cwd:<50}  {fmt_size(r['size']):>6}  {fmt_time(r['updated'])}")
+    if not confirm(f"\nDelete all {len(orphans)}? [{BOLD}y/N{RESET}] "):
+        print("Cancelled.")
+        return
+    for r in orphans:
+        if r["jsonl_file"] and Path(r["jsonl_file"]).exists():
+            Path(r["jsonl_file"]).unlink()
+    print(f"{GREEN}✓ Cleaned {len(orphans)} files  ({fmt_size(total)} freed){RESET}")
+
+
+def cmd_prune(days):
+    import time
+    cutoff = time.time() * 1000 - days * 86400 * 1000
+    old = [r for r in load_records() if r["updated"] < cutoff and r["status"] != "busy"]
+    if not old:
+        print(f"No sessions older than {days} days.")
+        return
+    total = sum(r["size"] for r in old)
+    print(f"Found {len(old)} file(s) older than {days} days  ({fmt_size(total)} total):\n")
+    for r in sorted(old, key=lambda r: r["updated"], reverse=True):
+        print(f"  {r['id'][:4]}  {(r['name'] or '(unnamed)'):<22}  {fmt_time(r['updated'])}")
+    if not confirm(f"\nDelete all {len(old)}? [{BOLD}y/N{RESET}] "):
+        print("Cancelled.")
+        return
+    for r in old:
+        for f in (r["meta_file"], r["jsonl_file"]):
+            if f and Path(f).exists():
+                Path(f).unlink()
+    print(f"{GREEN}✓ Pruned {len(old)} files  ({fmt_size(total)} freed){RESET}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+    elif a[0] in ("-v", "--version", "version"):
+        print(f"ccs {VERSION}")
+    elif a[0] == "list":
+        cmd_list()
+    elif a[0] == "delete" and len(a) > 1:
+        cmd_delete(a[1])
+    elif a[0] == "clean":
+        cmd_clean()
+    elif a[0] == "prune" and len(a) > 1:
+        if not a[1].isdigit():
+            print(f"{RED}prune needs a number of days, e.g.  ccs prune 30{RESET}")
+            sys.exit(1)
+        cmd_prune(int(a[1]))
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
