@@ -12,13 +12,14 @@
 - [ccs 解决什么问题](#ccs-解决什么问题)
 - [安装](#安装)
 - [命令详解](#命令详解)
-  - [`ccs list` — 列出所有会话](#ccs-list--列出所有会话)
+  - [`ccs list` — 列出会话（含精简版与目录过滤）](#ccs-list--列出会话含精简版与目录过滤)
   - [`ccs move` — 移动会话到其它目录](#ccs-move--移动会话到其它目录)
   - [`ccs delete` — 删除会话](#ccs-delete--删除会话)
-  - [`ccs clean` — 清理孤儿会话](#ccs-clean--清理孤儿会话)
+  - [`ccs clean` — 清理无元数据会话](#ccs-clean--清理无元数据会话)
   - [`ccs prune` — 按时间清理](#ccs-prune--按时间清理)
   - [`ccs version` / `ccs help`](#ccs-version--ccs-help)
 - [移动会话完整指南（重点）](#移动会话完整指南重点)
+- [状态(STATUS)含义](#状态status含义)
 - [工作原理](#工作原理)
 - [安全说明](#安全说明)
 - [许可证](#许可证)
@@ -34,28 +35,22 @@ Claude Code 把每一段对话存成一个 `.jsonl` 文件，路径是：
 ```
 
 关键点：**会话归属于你启动它时所在的目录**。比如你在 `/Users/hector` 下运行
-`claude`，这段对话就存到 `~/.claude/projects/-Users-hector/` 里。目录路径里的
-`/` 会被编码成 `-`（实际上所有非字母数字字符都会变成 `-`）。
+`claude`，这段对话就存到 `~/.claude/projects/-Users-hector/` 里。目录路径里所有
+非字母数字字符都会被编码成 `-`。
 
-另外还有一份元数据（会话名、状态、cwd、进程 PID）存在：
+另有一份**元数据**（会话名、状态、cwd、进程 PID）存在
+`~/.claude/sessions/<PID>.json`，它是**临时的**：进程结束就可能被清掉。
 
-```
-~/.claude/sessions/<PID>.json
-```
-
-`claude --resume` / `claude --continue` 在恢复时，**只看你当前所在目录对应的那个
-projects 文件夹**里有哪些 `.jsonl`。这就是为什么「同一段对话能不能恢复」取决于它
-所在的文件夹。
+`claude --resume` / `claude --continue` 恢复时，**只看你当前目录对应的那个
+projects 文件夹**里有哪些 `.jsonl`。所以「能不能恢复」取决于会话文件在哪个文件夹。
 
 ## ccs 解决什么问题
 
-用久了你会发现：
+- 几十段会话散落在各个早已忘记的目录下；
+- 同一段对话因复制在多个文件夹里有副本；
+- Claude Code **没有内置命令**删除某个会话，也没有命令把会话挪到别的目录。
 
-- 几十段会话散落在各个早已忘记的目录下，大量是 `(unnamed)`；
-- 同一段对话因为复制，在多个文件夹里有副本；
-- Claude Code **没有内置命令**来删除某个会话，也没有命令把会话挪到别的目录。
-
-`ccs` 就是补上这块：一个地方看全部会话、把会话搬到指定目录、删掉不想要的。
+`ccs` 补上这块：一个地方看全部会话、把会话搬到指定目录、删掉不想要的。
 
 ---
 
@@ -67,62 +62,74 @@ cd ccs-session-manager
 ./install.sh
 ```
 
-`install.sh` 会把 `ccs` 脚本复制到 `~/.local/bin/` 并赋予可执行权限。如果该目录
-不在你的 `PATH` 里，安装脚本会提示你往 shell 配置里加哪一行。
-
-**唯一要求是 Python 3.6+**（只用标准库，无需 pip，零依赖）。
-
-你也可以直接把单个 `ccs` 文件丢到 `PATH` 上的任意目录里手动安装。
+`install.sh` 把 `ccs` 复制到 `~/.local/bin/` 并赋予可执行权限；若该目录不在 `PATH`，
+安装脚本会提示你加哪一行。**唯一要求是 Python 3.6+**（只用标准库，零依赖）。
 
 ---
 
 ## 命令详解
 
 ```
-ccs list                    列出所有会话
-ccs move <id|name> <目录>   把会话移动到指定目录，使其可在该目录恢复
-ccs delete <id|name>        删除会话
-ccs clean                   删除所有孤儿会话
-ccs prune <天数>            删除超过 N 天未活动的会话
-ccs version | -v            打印版本
-ccs help    | -h            打印帮助
+ccs list [-c|--compact] [--here|<目录>]   列出会话（可精简 / 可按目录过滤）
+ccs move <id|名字> <目标目录>             把会话移动到指定目录
+ccs delete <id|名字>                      删除会话
+ccs clean                                 删除所有「无元数据」会话
+ccs prune <天数>                          删除超过 N 天未活动的会话
+ccs version | -v                          版本号
+ccs help    | -h                          帮助
 ```
 
-会话既可以用 **ID 前 4 位**指定，也可以用**会话名**指定。
+会话既可用 **ID 前 4 位**指定，也可用**会话名**。
 
-### `ccs list` — 列出所有会话
+### `ccs list` — 列出会话（含精简版与目录过滤）
 
-按最近活动时间倒序列出全部会话。**每个物理文件一行**，所以同一会话在不同文件夹
-的副本会分别显示，便于区分。
+按最近活动倒序列出，**每个物理文件一行**（副本分别显示）。
 
 ```
-  ID   NAME                   DIR                              UPDATED      MSG   SIZE  STATUS
-──────────────────────────────────────────────────────────────────────────────────────────
-a569  english-talking        ~                                05-30 02:35  201  745KB  ● active
-551f  refactor-auth          ~/Desktop/cc-project/cc-0525     05-28 20:49   16   36KB  idle
-4043  (unnamed)              ~/Desktop/cc-project/demo        05-26 14:36   10   19KB  orphaned
+  ID   NAME              DIR                          UPDATED       MSG   SIZE  STATUS
+a569  english-talking   ~                            05-30 11:44   492    2MB  ● active
+551f  refactor-auth     ~/Desktop/cc-project/demo    05-28 20:49    16   36KB  idle
+4043  claude-proxy      ~/Downloads/model-proxy      05-26 14:36    10   19KB  saved
 ```
-
-字段含义：
 
 | 字段 | 说明 |
 |------|------|
-| **ID** | 会话 ID 的前 4 位，用于在其它命令里指定该会话 |
-| **NAME** | 会话名（用 `/rename` 设置过的才有，否则显示 `(unnamed)`） |
-| **DIR** | 该文件**真实所在的目录**——也就是 `claude --resume` 能找到它的地方 |
-| **UPDATED** | 最后活动时间 |
-| **MSG** | 用户 / 助手消息条数 |
-| **SIZE** | 文件大小 |
-| **STATUS** | `● active` 正在运行 · `idle` 已关闭但有记录 · `orphaned` 只有对话文件、无元数据 |
+| **ID** | 会话 ID 前 4 位，用于在其它命令里指定 |
+| **NAME** | 会话名（`/rename` 设过的；现在即使关闭也能显示，见[工作原理](#工作原理)） |
+| **DIR** | 文件**真实所在目录**（`claude --resume` 能找到它的地方） |
+| **MSG / SIZE** | 消息条数 / 文件大小 |
+| **STATUS** | 见[状态含义](#状态status含义) |
+
+**精简版 `-c` / `--compact`** —— 会话多时，把宽表压成一行：ID、状态符号、名字（无名则显示目录）、日期。
+
+```
+$ ccs list -c
+a569 ● english-talking                          05-30 11:44
+4043 · claude-proxy                             05-26 14:36
+...
+45 sessions   ●=active  ·=saved
+```
+
+**按目录过滤 `--here` / `<目录>`** —— 只看某个项目的会话，方便针对性处理。`--here`（或 `.`）用当前目录，也可传任意路径：
+
+```bash
+cd ~/Desktop/cc-project/demo
+ccs list --here       # 只看这个目录的会话
+ccs delete 1a0f       # 然后针对性删
+
+ccs list ~/Downloads/model-proxy   # 不用 cd，直接过滤指定目录
+```
+
+可与 `-c` 叠加：`ccs list --here -c`。
 
 ### `ccs move` — 移动会话到其它目录
 
 ```bash
-ccs move <id|name> <目标目录>
+ccs move <id|名字> <目标目录>
 ```
 
-把会话的 `.jsonl` 文件复制进 `<目标目录>` 对应的 Claude project 文件夹，并删除
-原处的文件，使这段对话从此可以在 `<目标目录>` 下恢复。
+把会话的 `.jsonl` 复制进 `<目标目录>` 对应的 project 文件夹，并删除原处文件，使其
+能在 `<目标目录>` 下恢复。
 
 ```bash
 ccs move english-talking ~/Desktop/chats
@@ -133,11 +140,10 @@ ccs move english-talking ~/Desktop/chats
 # Resume it with:  cd ~/Desktop/chats && claude --resume
 ```
 
-> ⚠️ **正在运行的会话无法移动。** `ccs move` 会检测目标会话是否有存活进程占用，
-> 若有则**直接拒绝**并提示你先退出。原因见下方[完整指南](#移动会话完整指南重点)。
+> ⚠️ **正在运行的会话无法移动。** `ccs move` 会检查目标会话的进程 PID 是否存活，
+> 存活则**直接拒绝**并提示先退出。原因见[移动会话完整指南](#移动会话完整指南重点)。
 
-如果该会话在多个文件夹有副本，`ccs move` 会列出来让你选要移动哪一个；已经在目标
-目录里的副本会被自动排除。
+会话在多个文件夹有副本时，会列出来让你选；已在目标目录的副本自动排除。
 
 ### `ccs delete` — 删除会话
 
@@ -146,115 +152,93 @@ ccs delete a569              # 用 ID 前 4 位
 ccs delete english-talking   # 用会话名
 ```
 
-删除会话，同时移除它的 `.jsonl` 和元数据文件。若该会话在多个文件夹有副本，会逐一
-列出让你选择删哪一个（或 `[a]` 全删）：
+删除会话（同时移除 `.jsonl` 和元数据）。多副本时逐一列出让你选删哪个（或 `[a]` 全删）。
+正在运行的会话会标 `(running!)` 并警告。
 
-```
-Found 2 copies of this session — pick which to delete:
-  [1] a569  english-talking    ~ (running!)
-  [2] a569  (unnamed)          ~/Desktop/cc-project/chats
-  [a] all    [q] cancel
-```
+### `ccs clean` — 清理无元数据会话
 
-正在运行的会话会标记 `(running!)` 并警告——删了也会被活进程重新写回，应先退出。
-
-### `ccs clean` — 清理孤儿会话
-
-删除所有 **orphaned** 会话（只有 `.jsonl`、没有对应元数据的文件，通常是切换工作
-目录后的遗留）。删除前会列出清单并要求确认。
+删除所有 **saved**（只有 `.jsonl`、没有活元数据）的会话。删除前列出清单并要求确认。
 
 ```bash
 ccs clean
 ```
 
+> 注意：`saved` 不等于垃圾 —— 它们**仍可恢复**。清单看清楚再确认。
+
 ### `ccs prune` — 按时间清理
 
-删除最后活动时间超过 `<天数>` 天的会话。**正在运行的会话永远不会被删。**
+删除最后活动超过 `<天数>` 天的会话。**正在运行的永远不删。**
 
 ```bash
-ccs prune 30    # 删除 30 天前的会话
+ccs prune 30
 ```
 
 ### `ccs version` / `ccs help`
 
 ```bash
 ccs version     # 打印版本号
-ccs help        # 打印完整帮助
+ccs help        # 完整帮助
 ```
 
 ---
 
 ## 移动会话完整指南（重点）
 
-这是最容易踩坑的地方，单独讲清楚。
-
 ### 为什么不能移动「正在运行」的会话
 
-一个会话在终端里开着的时候，**它的进程会持续往 `.jsonl` 文件里追加内容**。
-所以如果你在它还活着的时候去复制 / 删除 / 移动这个文件：
+会话开着时，进程会持续往 `.jsonl` 追加内容。此时复制/删除/移动这个文件：删了下一回合
+又被写回，复制走的是随时变旧的快照 —— 等于「坐在树枝上锯树枝」。所以移动前必须让它停。
 
-- 你删掉它，下一回合（你一发消息、模型一回复）它立刻又被写回来；
-- 你复制走的是一个随时会变旧的快照。
-
-这就像「坐在树枝上锯这根树枝」。所以**移动一个会话，必须先让它停下来。**
-
-`ccs move` 内置了这道保护：它会检查该会话记录的进程 PID 是否还存活，存活就拒绝
-移动并提示你先退出。
+`ccs move` 内置保护：检查会话 PID 是否存活，存活就拒绝并提示退出。
 
 ### 标准三步流程
 
-以「把当前正在用的会话搬到 `~/Desktop/chats`」为例：
-
 ```bash
-# 第 1 步：在该会话的终端里退出
+# 1. 在该会话终端里退出
 /exit
-
-# 第 2 步：在任意普通终端执行
-ccs move english-talking ~/Desktop/chats
-
-# 第 3 步：去新目录恢复
+# 2. 任意普通终端执行（退出后用 ID 最稳，名字也支持）
+ccs move a569 ~/Desktop/chats
+# 3. 去新目录恢复
 cd ~/Desktop/chats && claude --resume
 ```
 
-退出后进程结束，文件定稿，`ccs move` 就能干净地搬走并删除原处文件。之后回到原来
-的目录再 `claude --resume`，列表里已经没有它了。
+---
 
-### 手动等价操作
+## 状态(STATUS)含义
 
-`ccs move` 本质上就是帮你自动完成下面这套（含安全检查）：
+| 状态 | 含义 |
+|------|------|
+| `● active` | 有活进程正在运行它（PID 存活） |
+| `idle` | 已关闭，但还留着元数据小档案 |
+| `saved` | 只剩对话文件、没有活元数据 —— **仍然完全可以 `claude --resume` 恢复** |
 
-```bash
-SID=<会话ID>
-P="$HOME/.claude/projects"
-cp "$P/<源目录编码>/$SID.jsonl" "$P/<目标目录编码>/$SID.jsonl"
-rm "$P/<源目录编码>/$SID.jsonl"
-```
+`idle` 和 `saved` 都是「已关闭、可恢复」，区别仅在于那份临时元数据是否还在。元数据是
+按进程（PID）临时存在的，进程一退就可能被清，所以大多数历史会话都是 `saved`。
 
-其中目录编码 = 把绝对路径里所有非字母数字字符换成 `-`。例如
-`/Users/hector/Desktop/chats` → `-Users-hector-Desktop-chats`。
+> `claude --resume` 只列**交互式**（`entrypoint=cli`）会话；通过 Agent SDK 程序化
+> 创建的会话（`sdk-cli` / `sdk-ts`）不会出现在 `--resume` 里，但 `ccs` 看得见、也能删。
 
 ---
 
 ## 工作原理
 
 - **`list`** 同时扫描 `~/.claude/projects/**/*.jsonl`（对话本体）和
-  `~/.claude/sessions/*.json`（元数据：名字、状态、cwd、PID），按真实路径把两者
-  关联起来。每个物理文件算一行，所以副本一目了然。
-- **DIR 列显示的是文件的物理位置**（即 `claude --resume` 实际会读取的地方），
-  而不是对话内容里记录的原始 cwd——一旦会话被复制过，这两者就不一样了。
-- 由于 Claude 的目录编码（非字母数字 → `-`）是**有损的**（`cc-project` 和
-  `cc/project` 编码后无法区分），`ccs` 通过**逐段查文件系统**来还原真实路径：
-  对每一段，看 `/` 拼接还是 `-` 拼接的路径在磁盘上真实存在，从而消除歧义。
-  对于已被删除、磁盘上不存在的目录，退回到朴素的 `/` 还原。
-- **运行状态判定**：通过检查元数据里记录的 PID 是否还存活来判断会话是否正在运行，
-  比单纯看 `status` 字段更可靠（已崩溃但元数据残留的情况也能识别）。
+  `~/.claude/sessions/*.json`（元数据），按真实路径关联。每个物理文件一行，副本一目了然。
+- **DIR 显示文件的物理位置**（`claude --resume` 真正读取的地方）。Claude 的目录编码
+  （非字母数字 → `-`）是**有损的**（`cc-project` vs `cc/project` 无法区分），`ccs` 靠
+  **逐段查文件系统**还原真实路径；对于**已删除**或含中文等特殊字符的目录，则**从对话
+  文件里记录的真实 `cwd` 读回原名**。
+- **名字在退出后依然保留**：会话名本来只存在临时元数据里，进程一退就没了。`ccs` 还会
+  **从对话文件内容里读回标题**（`customTitle` / `agentName`），所以关闭的会话在列表里
+  仍显示名字，也能继续用名字做 `move` / `delete`。
+- **运行状态判定**靠检查记录的 PID 是否存活，比单看 `status` 字段更可靠。
 
 ---
 
 ## 安全说明
 
 - `ccs` 只读写 **`~/.claude` 下的本地文件**，不发起任何网络请求。
-- 删除 / 移动**正在运行**的会话会被拦截或警告——请先退出该会话。
+- 删除 / 移动**正在运行**的会话会被拦截或警告 —— 请先退出。
 - 所有破坏性操作（delete / clean / prune / move）执行前都会要求确认。
 
 ---
